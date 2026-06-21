@@ -1,0 +1,29 @@
+[Unit]
+Description=MaxPaper live wallpaper (Wayland layer-shell)
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/maxpaper run
+Restart=on-failure
+RestartSec=5
+# Keep logs quiet; use journalctl --user -u maxpaper.service for debugging
+StandardOutput=journal
+StandardError=journal
+
+# This is just a wallpaper. It should never make the rest of the system
+# feel slower. These settings push it below normal priority for both
+# CPU and disk/IO scheduling so foreground apps always win contention.
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=20
+
+# Display-side frame cap (separate from the one-time ffmpeg encode step).
+# Lower = lighter on CPU/compositor; raise for smoother motion if your
+# hardware can spare it. See README.md for details.
+Environment=MAXPAPER_RENDER_FPS=15
+
+[Install]
+WantedBy=default.target

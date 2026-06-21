@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PREFIX="/usr/local"
+LIBEXEC="$PREFIX/libexec/maxpaper"
+CORE="$LIBEXEC/maxpaper-bin"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/maxpaper"
+CFG_FILE="$CFG_DIR/config"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/maxpaper"
+CACHE_VIDEO="$CACHE_DIR/optimized.mp4"
+SERVICE="maxpaper.service"
+
+ensure_cfg() {
+  mkdir -p "$CFG_DIR"
+  if [[ ! -f "$CFG_FILE" ]]; then
+    cat >"$CFG_FILE" <<CFG
+# MaxPaper config
+VIDEO=
+SOURCE_VIDEO=
+COLOR=#000000
+CFG
+  fi
+}
+
+cfg_get() {
+  local key="$1"
+  [[ -f "$CFG_FILE" ]] || return 0
+  awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$CFG_FILE"
+}
+
+cfg_set() {
+  local key="$1" value="$2"
+  ensure_cfg
+  local tmp
+  tmp="$(mktemp)"
+  awk -F= -v k="$key" -v v="$value" '
+    BEGIN { done=0 }
+    $1==k { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "$CFG_FILE" > "$tmp"
+  mv "$tmp" "$CFG_FILE"
+}
+
+service_is_active() {
+  systemctl --user is-active --quiet "$SERVICE" 2>/dev/null
+}
+
+optimize_video() {
+  local src="$1"
+  mkdir -p "$CACHE_DIR"
+
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "[maxpaper] ffmpeg not found, using original video." >&2
+    printf '%s\n' "$src"
+    return 0
+  fi
+
+  local target_width="${MAXPAPER_OPT_WIDTH:-480}"
+  local target_fps="${MAXPAPER_OPT_FPS:-12}"
+  local crf="${MAXPAPER_OPT_CRF:-38}"
+  local preset="${MAXPAPER_OPT_PRESET:-medium}"
+  local tmp="$CACHE_DIR/.optimized.tmp.mp4"
+
+  echo "[maxpaper] Optimizing video for wallpaper playback..." >&2
+  if ! ffmpeg -y -v warning -i "$src" \
+    -an -sn -dn \
+    -vf "fps=${target_fps},scale='min(${target_width},iw)':-2:flags=fast_bilinear" \
+    -c:v libx264 -preset "$preset" -crf "$crf" \
+    -tune fastdecode -profile:v baseline -level 3.0 -pix_fmt yuv420p \
+    -x264-params ref=1:weightp=0:subme=0:trellis=0:aq-mode=0 \
+    -movflags +faststart -g 80 -keyint_min 40 -sc_threshold 0 -bf 0 \
+    "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv -f "$tmp" "$CACHE_VIDEO"
+  printf '%s\n' "$CACHE_VIDEO"
+}
+
+cmd_setvideo() {
+  local src="${1:-}"
+  if [[ -z "$src" ]]; then
+    echo "Usage: maxpaper setvideo /absolute/path/to/video.mp4" >&2
+    exit 1
+  fi
+  if [[ "$src" != /* ]]; then
+    echo "[maxpaper] Please use an absolute path." >&2
+    exit 1
+  fi
+  if [[ ! -f "$src" ]]; then
+    echo "[maxpaper] File not found: $src" >&2
+    exit 1
+  fi
+
+  ensure_cfg
+  cfg_set SOURCE_VIDEO "$src"
+
+  local chosen
+  if chosen="$(optimize_video "$src")"; then
+    cfg_set VIDEO "$chosen"
+  else
+    echo "[maxpaper] ffmpeg optimization failed, falling back to original video." >&2
+    cfg_set VIDEO "$src"
+    chosen="$src"
+  fi
+
+  echo "Saved SOURCE_VIDEO=$src"
+  echo "Saved VIDEO=$chosen"
+
+  if service_is_active; then
+    systemctl --user restart "$SERVICE" || true
+  fi
+}
+
+cmd_status() {
+  ensure_cfg
+  local service_state="inactive"
+  if service_is_active; then
+    service_state="active"
+  fi
+  echo "Service: $service_state"
+  echo "Video:   $(cfg_get VIDEO)"
+  local src
+  src="$(cfg_get SOURCE_VIDEO)"
+  if [[ -n "$src" ]]; then
+    echo "Source:  $src"
+  fi
+  echo "Color:   $(cfg_get COLOR)"
+}
+
+cmd_optimize() {
+  local src
+  src="${1:-$(cfg_get SOURCE_VIDEO)}"
+  if [[ -z "$src" ]]; then
+    echo "Usage: maxpaper optimize /absolute/path/to/video.mp4" >&2
+    exit 1
+  fi
+  if [[ "$src" != /* || ! -f "$src" ]]; then
+    echo "[maxpaper] File not found: $src" >&2
+    exit 1
+  fi
+  local out
+  out="$(optimize_video "$src")"
+  cfg_set SOURCE_VIDEO "$src"
+  cfg_set VIDEO "$out"
+  echo "Optimized VIDEO=$out"
+}
+
+cmd_uninstall() {
+  echo "[maxpaper] Stopping + disabling user service (if present)..."
+  systemctl --user disable --now "$SERVICE" 2>/dev/null || true
+
+  echo "[maxpaper] Removing unit + config/cache..."
+  rm -f "$HOME/.config/systemd/user/maxpaper.service"
+  rm -rf "$CFG_DIR"
+  rm -rf "$CACHE_DIR"
+
+  echo "[maxpaper] Reloading user systemd..."
+  systemctl --user daemon-reload 2>/dev/null || true
+
+  echo "[maxpaper] Removing binaries (sudo required)..."
+  sudo rm -f "$PREFIX/bin/maxpaper" "$CORE"
+  sudo rmdir "$LIBEXEC" 2>/dev/null || true
+
+  echo "[maxpaper] Uninstalled."
+}
+
+cmd_run() {
+  exec "$CORE" run
+}
+
+case "${1:-}" in
+  setvideo)
+    shift
+    cmd_setvideo "$@"
+    ;;
+  optimize)
+    shift
+    cmd_optimize "$@"
+    ;;
+  start)
+    exec systemctl --user start "$SERVICE"
+    ;;
+  stop)
+    exec systemctl --user stop "$SERVICE"
+    ;;
+  restart)
+    exec systemctl --user restart "$SERVICE"
+    ;;
+  status)
+    cmd_status
+    ;;
+  uninstall)
+    shift
+    cmd_uninstall "$@"
+    ;;
+  run)
+    shift
+    cmd_run "$@"
+    ;;
+  "")
+    echo "Usage: maxpaper {setvideo|optimize|start|stop|restart|status|uninstall|run}
+Defaults in v19 are lightweight: 480w / 12fps / CRF 38" >&2
+    exit 1
+    ;;
+  *)
+    if [[ -x "$CORE" ]]; then
+      exec "$CORE" "$@"
+    fi
+    echo "Unknown command: $1" >&2
+    exit 1
+    ;;
+esac
